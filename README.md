@@ -1,4 +1,4 @@
-# Voice-to-Text AI Transcription Tool
+# Wispr Flow Py
 
 An open-source, cost-effective alternative to WisprFlow designed for casual transcription needs. This tool uses OpenAI and OpenRouter APIs to provide high-quality transcription with convenient keyboard shortcuts.
 
