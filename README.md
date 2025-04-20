@@ -1,4 +1,4 @@
-# Wispr Flow PY
+# Voice-to-Text AI Transcription Tool
 
 An open-source, cost-effective alternative to WisprFlow designed for casual transcription needs. This tool uses OpenAI and OpenRouter APIs to provide high-quality transcription with convenient keyboard shortcuts.
 
@@ -59,6 +59,24 @@ pynput
    ```
 2. Press and hold `Ctrl+Alt` while speaking for basic transcription
 3. Press and hold `Ctrl+Shift` while speaking for custom processing with clipboard content
+
+## Creating an Executable
+
+You can compile this script into a standalone executable using PyInstaller:
+
+1. Install PyInstaller:
+   ```
+   pip install pyinstaller
+   ```
+
+2. Create the executable:
+   ```
+   pyinstaller --onefile --noconsole main.py
+   ```
+
+3. Find the executable in the `dist` folder created by PyInstaller
+
+This allows you to run the program without having Python installed and makes distribution easier.
 
 ## Model Selection
 
