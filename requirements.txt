@@ -1,0 +1,6 @@
+numpy
+sounddevice
+clipboard
+pyautogui
+openai
+pynput
