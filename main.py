@@ -1,323 +1,513 @@
-import threading
-import queue
-import time
-import wave
-from io import BytesIO
+# -*- coding: utf-8 -*-
+import ctypes, json, queue, threading, time, traceback, wave, io
+from concurrent.futures import ThreadPoolExecutor
+from typing import Optional, Tuple
 
 import numpy as np
-import sounddevice as sd
 import clipboard
-import pyautogui
+import sounddevice as sd
 import winsound
-from openai import OpenAI as OpenAIOfficial
-from openai import OpenAI as OpenAIProxy
+from deepgram import DeepgramClient, FileSource, PrerecordedOptions
+from openai import OpenAI as OpenAIProxy 
 from pynput import keyboard
+import tkinter as tk
 
-# ===== PROMPTS & API SETUP =====
+# ───────────────────── CONFIG ────────────────────── #
 
+DG_API_KEY         = "change_me" # WARNING - DO NOT SHARE THESE KEYS PUBLICLY!
+OPENROUTER_API_KEY = "change_me" # WARNING - DO NOT SHARE THESE KEYS PUBLICLY!
+
+
+MODEL_FORMATTER  = "google/gemini-flash-1.5-8b" # Model for Ctrl+Alt
+MODEL_ASSISTANT  = "google/gemini-2.0-flash-001" # Model for Ctrl+Shift assistant
+
+print("--- Initializing Clients ---")
+try:
+    dg_client   = DeepgramClient(DG_API_KEY)
+    print("Deepgram client initialized.")
+    openrouter  = OpenAIProxy(api_key=OPENROUTER_API_KEY, base_url="https://openrouter.ai/api/v1")
+    print("OpenRouter client initialized.")
+except Exception as e:
+    print(f"!!! Error initializing clients: {e}")
+    traceback.print_exc()
+    exit(1)
+
+EXECUTOR    = ThreadPoolExecutor(max_workers=6)
+DEBOUNCE_MS = 500
+
+# ───────────────────── PROMPTS ───────────────────── #
+
+# Prompt for Ctrl+Alt (Formatting)
 CTRL_ALT_PROMPT = """
-You are a transcript‐only editor. The user’s audio has been transcribed; your job is ONLY to perform these edits:
-- correct grammar, spelling & punctuation
-- remove all filler words (um, uh, like, etc.)
-- collapse self‐corrections (“sunny, no, rainy” → “rainy”)
-- format any listed text as bullets or other markdown, organization is encouraged.
-- format any bold, italics, or other markdown formatting requested / you think should be used.
-- lowercase everything
-- use common abbreviations (info, app, tech, etc.)
-- optionally use slang to preserve tone
-- do not censor anything
-- keep all curse words
+role: transcript-only editor.
+task: edit the provided transcript using only the rules below. output only the edited text.
+rules:
 
-DO NOT:
-- answer questions
-- add or invent new content
-- summarize or paraphrase beyond the above rules
-- explain, comment, quote, or wrap in code blocks
-- say you are 'ready' for something
+organize and format things nicely as you see fit.
+correct grammar, spelling, punctuation.
+remove filler words (um, uh, like, etc.).
+collapse self-corrections (e.g., "red, no, blue car" -> "blue car").
+make everything lowercase.
+use common abbreviations (idk, lol, tech, asap, etc.).
+keep slang and curse words.
+output:
 
-Output must be the edited text ONLY, nothing else. If there are no corrections, just output the transcription.
-"""
+if edits are made, output only the edited lowercase text.
+if no edits are needed, output the original transcript unchanged.
+""".strip()
 
+# Prompt for Ctrl+Shift (Assistant) - Added clipboard placeholder
 CTRL_SHIFT_PROMPT = """
-You are to do exactly what the user requests using the text they passed in their clipboard if provided.
-User request: [USER_REQUEST].
-Text: [CLIPBOARD_TEXT].
-If the user did not pass any text, just do as they say.
-Do NOT wrap anything in quotes, and do NOT provide explanations.
-Do not say, "Sure heres X" or anything along the lines of that.
-Only the transcription. Sentences should not exceed 2, unless asked by the user otherwise.
-"""
+You are a concise AI assistant. Follow the user's request based on their transcribed audio.
+Use the provided clipboard text if the user's request refers to it.
 
-OPENAI_API_KEY     = "YOUR_KEY_HERE" # Important, DO NOT SHARE THIS KEY. If you feel as though it has been leaked, revoke, and generate a new one.
-                                     # This key allows ANYONE to use your credits if shared.
-OPENROUTER_API_KEY = "YOUR_KEY_HERE" # Important, DO NOT SHARE THIS KEY. If you feel as though it has been leaked, revoke, and generate a new one.
-                                     # This key allows ANYONE to use your credits if shared.
-GOOGLE_MODEL_QUESTION    = "google/gemini-2.0-flash-001"
-GOOGLE_MODEL_TRANSCRIBE  = "openai/gpt-4.1-mini"
+Clipboard Text:
+{clipboard_content}
 
-openai_client     = OpenAIOfficial(api_key=OPENAI_API_KEY)
-openrouter_client = OpenAIProxy(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=OPENROUTER_API_KEY,
-)
+User Request (from audio):
+{user_request}
 
-# ===== DEBOUNCED PASTE =====
+Instructions:
+- If the clipboard text is "(empty)" or the user request doesn't seem to relate to it, just fulfill the user's audio request directly.
+- Be direct and answer concisely.
+- Do not add explanations unless asked.
+- Keep output brief, ideally one or two sentences, unless the request requires more detail.
+- Do not wrap your response in quotes or code blocks, unless outputting code.
+- You may ignore the concise instruction if instructed to output long text.
+""".strip()
+
+
+# ───────────────────── UI BADGE ───────────────────── #
+
+class StatusBadge:
+    _COL = {"ready": "#222", "recording": "#b40000", "processing": "#444"}
+
+    def __init__(self):
+        self.tk  = tk.Tk()
+        self.tk.overrideredirect(True)
+        self.tk.attributes("-topmost", True)
+        self.lbl = tk.Label(self.tk, text="ready", fg="white",
+                            font=("Segoe UI", 10, "bold"),
+                            bg=self._COL["ready"], padx=10, pady=2)
+        self.lbl.pack()
+        self._place()
+    def _place(self):
+        self.tk.update_idletasks()
+        w, h = self.tk.winfo_width(), self.tk.winfo_height()
+        sw, sh = self.tk.winfo_screenwidth(), self.tk.winfo_screenheight()
+        self.tk.geometry(f"+{(sw-w)//2}+{sh-h-40}")
+    def set(self, txt):
+        if txt == "ready" or self._COL.get(txt) == self._COL["processing"]:
+             print(f"UI: Status -> {txt}")
+        def _u():
+            self.lbl.config(text=txt, bg=self._COL.get(txt, "#222")); self._place()
+        self.tk.after(1, _u)
+
+badge = StatusBadge()
+
+# ───────────────────── SOUND FX ───────────────────── #
+
+beep = winsound.Beep
+play_ding   = lambda: beep( 880,110) # Sound for Ctrl+Alt start
+play_hi     = lambda: beep(1200,115) # Sound for Ctrl+Shift start
+play_end    = lambda: beep( 590,150)
+play_err    = lambda: (print("SFX: Error sound played"), beep(250,200), beep(210,120))
+play_short  = lambda: (print("SFX: Short recording sound played"), beep( 380,180))
+
+# ───────────────────── SMART PASTE (Win) ──────────── #
+
+PUL = ctypes.POINTER(ctypes.c_ulong)
+class KeyBdInput(ctypes.Structure):
+    _fields_ = [("wVk", ctypes.c_ushort),
+                ("wScan", ctypes.c_ushort),
+                ("dwFlags", ctypes.c_ulong),
+                ("time", ctypes.c_ulong),
+                ("dwExtraInfo", PUL)]
+
+class HardwareInput(ctypes.Structure):
+    _fields_ = [("uMsg", ctypes.c_ulong),
+                ("wParamL", ctypes.c_short),
+                ("wParamH", ctypes.c_ushort)]
+
+class MouseInput(ctypes.Structure):
+    _fields_ = [("dx", ctypes.c_long),
+                ("dy", ctypes.c_long),
+                ("mouseData", ctypes.c_ulong),
+                ("dwFlags", ctypes.c_ulong),
+                ("time", ctypes.c_ulong),
+                ("dwExtraInfo", PUL)]
+
+class Input_I(ctypes.Union):
+    _fields_ = [("ki", KeyBdInput),
+                ("mi", MouseInput),
+                ("hi", HardwareInput)]
+
+class Input(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_ulong),
+                ("ii", Input_I)]
+
+def _get_extra_info():
+    try:
+        return ctypes.cast(ctypes.windll.user32.GetMessageExtraInfo(), PUL)
+    except AttributeError:
+        print("!!! PASTE Warning: Could not call GetMessageExtraInfo. Using default.")
+        return PUL()
+
+def send_ctrl_v():
+    try:
+        user32 = ctypes.windll.user32
+        INPUT_KEYBOARD = 1
+        KEYEVENTF_KEYUP = 0x0002
+        VK_CONTROL = 0x11
+        VK_V = 0x56
+        extra = _get_extra_info()
+        ctrl_down = Input(type=INPUT_KEYBOARD, ii=Input_I(ki=KeyBdInput(wVk=VK_CONTROL, wScan=0, dwFlags=0, time=0, dwExtraInfo=extra)))
+        v_down = Input(type=INPUT_KEYBOARD, ii=Input_I(ki=KeyBdInput(wVk=VK_V, wScan=0, dwFlags=0, time=0, dwExtraInfo=extra)))
+        v_up = Input(type=INPUT_KEYBOARD, ii=Input_I(ki=KeyBdInput(wVk=VK_V, wScan=0, dwFlags=KEYEVENTF_KEYUP, time=0, dwExtraInfo=extra)))
+        ctrl_up = Input(type=INPUT_KEYBOARD, ii=Input_I(ki=KeyBdInput(wVk=VK_CONTROL, wScan=0, dwFlags=KEYEVENTF_KEYUP, time=0, dwExtraInfo=extra)))
+        inputs = (Input * 4)(ctrl_down, v_down, v_up, ctrl_up)
+        user32.SendInput(4, ctypes.byref(inputs), ctypes.sizeof(Input))
+    except Exception as e:
+        print(f"!!! PASTE Error: {e}")
+        traceback.print_exc()
 
 _last_paste = 0.0
-DEBOUNCE_SEC = 0.5
-
 def safe_paste():
     global _last_paste
     now = time.time()
-    if now - _last_paste > DEBOUNCE_SEC:
-        pyautogui.hotkey('ctrl', 'v')
+    if now - _last_paste > DEBOUNCE_MS / 1000:
+        print("PASTE: Pasting content.")
+        send_ctrl_v()
         _last_paste = now
+    else:
+        print("PASTE: Debounced.")
 
-# ===== AUDIO RECORDER =====
+# ───────────────────── AUDIO RECORDER ─────────────── #
 
-class AudioRecorder:
-    def __init__(self, samplerate=16000, channels=1, dtype='int16', timeout=0.01):
-        self.samplerate = samplerate
-        self.channels   = channels
-        self.dtype      = dtype
-        self._timeout   = timeout
-        self._queue     = queue.Queue()
-        self._frames    = []
-        self._recording = False
-        self._stream    = None
-        self._thread    = None
-
-    def _callback(self, indata, frames, time_info, status):
-        if self._recording:
-            self._queue.put(indata.copy())
-
+class Recorder:
+    def __init__(self, rate=16000):
+        self.rate = rate; self.q = queue.Queue(); self.frames=[]
+        self.rec = threading.Event()
+        self.stream = None
+        print(f"Recorder initialized with rate {rate}Hz.")
+    def _cb(self, data, frame_count, time_info, status):
+        if status:
+            print(f"REC: Status warning in callback: {status}")
+        if self.rec.is_set():
+            self.q.put_nowait(data.copy())
     def start(self):
-        self._frames.clear()
-        self._recording = True
-        self._stream = sd.InputStream(
-            samplerate=self.samplerate,
-            channels=self.channels,
-            dtype=self.dtype,
-            callback=self._callback
-        )
-        self._stream.start()
-        self._thread = threading.Thread(target=self._capture, daemon=True)
-        self._thread.start()
-
-    def _capture(self):
-        while self._recording:
-            try:
-                chunk = self._queue.get(timeout=self._timeout)
-                self._frames.append(chunk)
-            except queue.Empty:
-                continue
-
-    def stop(self):
-        self._recording = False
-        if self._stream:
-            self._stream.stop()
-        if self._thread:
-            self._thread.join()
-        if not self._frames:
-            return None, 0
-        audio    = np.concatenate(self._frames, axis=0).flatten().astype(np.int16)
-        duration = len(audio) / self.samplerate
-        return audio, duration
-
-recorder = AudioRecorder()
-
-# ===== TRANSCRIPTION & CHAT =====
-
-def transcribe_audio(audio_np):
-    buf = BytesIO()
-    with wave.open(buf, 'wb') as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(16000)
-        wf.writeframes(audio_np.tobytes())
-    buf.name = "audio.wav"
-    buf.seek(0)
-    resp = openai_client.audio.transcriptions.create(
-        model="gpt-4o-mini-transcribe",
-        file=buf
-    )
-    return resp.text
-
-def openrouter_chat(system_prompt, user_msg,
-                    temperature=0.6, top_p=1.0,
-                    max_tokens=500, stop=None):
-    payload = {
-      "model":       GOOGLE_MODEL_TRANSCRIBE,
-      "temperature": temperature,
-      "top_p":       top_p,
-      "max_tokens":  max_tokens,
-      "messages": [
-        {"role":"system", "content": system_prompt},
-        {"role":"user",   "content": user_msg}
-      ]
-    }
-    if stop is not None:
-        payload["stop"] = stop
-
-    resp = openrouter_client.chat.completions.create(**payload)
-    return resp.choices[0].message.content
-
-def openrouter_chat_q(system_prompt, user_msg,
-                      temperature=1.0, top_p=1.0,
-                      max_tokens=500, stop=None):
-    payload = {
-      "model":       GOOGLE_MODEL_QUESTION,
-      "temperature": temperature,
-      "top_p":       top_p,
-      "max_tokens":  max_tokens,
-      "messages": [
-        {"role":"system", "content": system_prompt},
-        {"role":"user",   "content": user_msg}
-      ]
-    }
-    if stop is not None:
-        payload["stop"] = stop
-
-    resp = openrouter_client.chat.completions.create(**payload)
-    return resp.choices[0].message.content
-
-# ===== SOUND NOTIFICATIONS =====
-
-def play_ding():       winsound.Beep( 880, 110)
-def play_high_ding():  winsound.Beep(1200, 115)
-def play_end_ding():   winsound.Beep( 590, 150)
-def play_error():      winsound.Beep( 250, 200); winsound.Beep(210, 120)
-def play_short_ding(): winsound.Beep( 380, 180)
-
-# ===== CTRL+ALT LOGIC =====
-
-pressed_alt    = set()
-recording_alt  = False
-alt_guard      = False
-
-def _start_alt():
-    play_ding()
-    recorder.start()
-
-def _stop_alt():
-    play_end_ding()
-    audio, duration = recorder.stop()
-    if duration < 0.5:
-        play_short_ding()
-        return
-    if audio is None:
-        play_error()
-        clipboard.copy("ERROR: No audio detected!")
-        return
-    def worker(audio=audio):
+        print("REC: Start recording...")
+        self.frames.clear(); self.q = queue.Queue(); self.rec.set()
         try:
-            transcript = transcribe_audio(audio)
-            out = openrouter_chat(
-                system_prompt = CTRL_ALT_PROMPT,
-                user_msg      = transcript,
-                temperature   = 0.2,
-                top_p         = 1,
-                max_tokens    = 800
-            )
-            clipboard.copy(out.rstrip())
-            safe_paste()
-        except Exception:
-            play_error()
-    threading.Thread(target=worker, daemon=True).start()
+            self.stream = sd.InputStream(samplerate=self.rate, channels=1,
+                                         dtype='int16', callback=self._cb)
+            self.stream.start()
+            threading.Thread(target=self._pump, daemon=True).start()
+        except Exception as e:
+            print(f"!!! REC Error starting stream: {e}")
+            traceback.print_exc()
+            badge.set("ready")
+            play_err()
+            self.rec.clear()
+    def _pump(self):
+        while self.rec.is_set():
+            try:
+                frame = self.q.get(timeout=0.1)
+                self.frames.append(frame)
+            except queue.Empty:
+                pass
+            except Exception as e:
+                print(f"!!! REC Error in pump: {e}")
+    def stop(self)->Tuple[Optional[np.ndarray],float]:
+        print("REC: Stop recording...")
+        self.rec.clear()
+        if self.stream:
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception as e:
+                print(f"!!! REC Error stopping stream: {e}")
+                traceback.print_exc()
+            self.stream = None
+        else:
+            print("REC: Stop called but stream was not active.")
 
-def on_press_alt(key):
-    global recording_alt, alt_guard
-    if key in (keyboard.Key.ctrl_l, keyboard.Key.ctrl_r):
-        pressed_alt.add('ctrl')
-    elif key in (keyboard.Key.alt_l, keyboard.Key.alt_r):
-        pressed_alt.add('alt')
-    if {'ctrl','alt'} <= pressed_alt and not recording_alt:
-        recording_alt = True
-        alt_guard     = False
-        threading.Thread(target=_start_alt, daemon=True).start()
+        if not self.frames:
+            print("REC: No frames recorded.")
+            return None, 0.0
 
-def on_release_alt(key):
-    global recording_alt, alt_guard
-    if key in (keyboard.Key.ctrl_l, keyboard.Key.ctrl_r):
-        pressed_alt.discard('ctrl')
-    elif key in (keyboard.Key.alt_l, keyboard.Key.alt_r):
-        pressed_alt.discard('alt')
-    if recording_alt and not alt_guard and not {'ctrl','alt'} <= pressed_alt:
-        alt_guard     = True
-        recording_alt = False
-        threading.Thread(target=_stop_alt, daemon=True).start()
+        try:
+            audio = np.concatenate(self.frames, axis=0).astype(np.int16)
+            duration = len(audio) / self.rate
+            print(f"REC: Recording stopped. Duration: {duration:.2f}s")
+            return audio, duration
+        except ValueError as e:
+             print(f"!!! REC Error concatenating frames: {e}")
+             print(f"!!! REC Frame shapes: {[f.shape for f in self.frames]}")
+             traceback.print_exc()
+             return None, 0.0
+        except Exception as e:
+            print(f"!!! REC Error processing frames: {e}")
+            traceback.print_exc()
+            return None, 0.0
 
-# ===== CTRL+SHIFT LOGIC =====
+rec = Recorder()
 
-pressed_shift    = set()
-recording_shift  = False
-shift_guard      = False
+# ───────────────────── DEEPGRAM STT ───────────────────── #
 
-def _start_shift():
-    play_high_ding()
-    recorder.start()
+def transcribe(audio: np.ndarray)->str:
+    print(f"STT: Transcribing audio (size: {audio.size} bytes)...")
+    if audio.size == 0:
+        print("STT: Audio data is empty, cannot transcribe.")
+        return ""
 
-def worker(audio):
+    pay: FileSource = {"buffer": audio.tobytes()}
+    # Options suitable for getting a raw transcript for further processing
+    opt = PrerecordedOptions(
+        model="nova-3",
+        language="en",
+        smart_format=True, # Keep smart format for basic structure
+        punctuate=True,    # Keep punctuation
+        paragraphs=False,  # Let LLM handle paragraphs
+        filler_words=True, # Keep filler words for LLM context if needed
+        channels=1,
+        sample_rate=rec.rate,
+        encoding="linear16"
+    )
+
+    transcript = ""
+    for attempt in range(2):
+        try:
+            print(f"STT: Sending request to Deepgram (attempt {attempt+1})...")
+            start_time = time.time()
+            rsp = dg_client.listen.rest.v("1").transcribe_file(pay, opt, timeout=20.0)
+            end_time = time.time()
+            print(f"STT: Deepgram response received in {end_time - start_time:.2f}s.")
+
+            if rsp and rsp.results and rsp.results.channels and rsp.results.channels[0].alternatives:
+                transcript = rsp.results.channels[0].alternatives[0].transcript
+                print(f"STT: Transcription successful: '{transcript[:80]}...'")
+                return transcript
+            else:
+                if rsp and rsp.results and rsp.results.channels and not rsp.results.channels[0].alternatives:
+                     print("STT: Transcription result is empty (no alternatives found).")
+                     return ""
+                print("!!! STT Error: Deepgram response structure unexpected or empty.")
+                raise ValueError("Invalid response structure from Deepgram")
+
+        except Exception as e:
+            print(f"!!! STT Error (Attempt {attempt+1}): {e}")
+            if attempt == 1:
+                 traceback.print_exc()
+            if attempt == 0:
+                print("STT: Retrying after delay...")
+                time.sleep(0.5)
+            else:
+                print("!!! STT Failed after retries.")
+
+    print("STT: Transcription failed after retries, returning empty string.")
+    return ""
+
+# ───────────────────── OPENROUTER CHAT ─────────────── #
+
+def chat(model, system, user, temp=1, top_p=1, max_tokens=1000):
+    if model == "change_me":
+        print(f"!!! LLM Error: Assistant model is set to '{model}'. Please update MODEL_ASSISTANT.")
+        raise ValueError(f"Assistant model not configured: {model}")
+
+    print(f"LLM: Calling model '{model}'...")
     try:
-        clipboard_text = clipboard.paste()
-        req = transcribe_audio(audio)
-        prompt = CTRL_SHIFT_PROMPT \
-            .replace("[USER_REQUEST]", req) \
-            .replace("[CLIPBOARD_TEXT]", clipboard_text)
-        out = openrouter_chat_q(
-            system_prompt=prompt,
-            user_msg=req
+        start_time = time.time()
+        r = openrouter.chat.completions.create(
+            model=model, temperature=temp, top_p=top_p, max_tokens=max_tokens,
+            messages=[{"role":"system","content":system},{"role":"user","content":user}],
         )
-        clipboard.copy(out)
+        end_time = time.time()
+        response_text = r.choices[0].message.content
+        print(f"LLM: Response received in {end_time - start_time:.2f}s.")
+        return response_text
+    except Exception as e:
+        print(f"!!! LLM Error calling model {model}: {e}")
+        traceback.print_exc()
+        raise e
+
+# ───────────────────── WORKERS ─────────────────────── #
+
+# Worker for Ctrl+Alt (Formatting)
+def alt_task(audio):
+    print("--- Starting Alt Task (Formatter) ---")
+    try:
+        badge.set("processing")
+        transcript = transcribe(audio)
+        if not transcript:
+            print("ALT_TASK: Transcription failed or empty, aborting.")
+            play_err()
+            return
+
+        print("ALT_TASK: Calling Formatter LLM...")
+        # Use MODEL_FORMATTER and specific parameters for formatting
+        cleaned_transcript = chat(MODEL_FORMATTER, CTRL_ALT_PROMPT, transcript,
+                                  temp=0.5, top_p=1, max_tokens=1000).rstrip()
+
+        if not cleaned_transcript:
+             print("ALT_TASK: Formatting returned empty result, aborting paste.")
+             play_err()
+             return
+
+        print(f"ALT_TASK: Formatting complete.")
+        clipboard.copy(cleaned_transcript)
+        print("ALT_TASK: Copied formatted text to clipboard.")
         safe_paste()
-        # clipboard.copy("")  # Uncomment if you want to clear clipboard after pasting
-    except Exception:
-        play_error()
+    except Exception as e:
+        print(f"!!! ALT_TASK Error: {e}")
+        play_err()
+    finally:
+        print("--- Finished Alt Task ---")
+        badge.set("ready")
 
-def _stop_shift():
-    play_end_ding()
-    audio, duration = recorder.stop()
-    if duration < 0.5:
-        play_short_ding()
-        return
-    if audio is None:
-        play_error()
-        clipboard.copy("ERROR: No audio detected!")
-        return
-    threading.Thread(target=worker, args=(audio,), daemon=True).start()
+# Worker for Ctrl+Shift (Assistant)
+def shift_task(audio):
+    print("--- Starting Shift Task (Assistant) ---")
+    try:
+        badge.set("processing")
+        request_transcript = transcribe(audio)
+        if not request_transcript:
+            print("SHIFT_TASK: Transcription failed or empty, aborting.")
+            play_err()
+            return
 
-def on_press_shift(key):
-    global recording_shift, shift_guard
-    if key in (keyboard.Key.ctrl_l, keyboard.Key.ctrl_r):
-        pressed_shift.add('ctrl')
-    elif key in (keyboard.Key.shift_l, keyboard.Key.shift_r):
-        pressed_shift.add('shift')
-    if {'ctrl','shift'} <= pressed_shift and not recording_shift:
-        recording_shift = True
-        shift_guard     = False
-        threading.Thread(target=_start_shift, daemon=True).start()
+        # Get clipboard content
+        print("SHIFT_TASK: Getting clipboard content...")
+        try:
+            cb_content = clipboard.paste() or "(empty)"
+            print(f"SHIFT_TASK: Clipboard content: '{cb_content[:100]}...'")
+        except Exception as e:
+            print(f"!!! SHIFT_TASK: Error getting clipboard content: {e}")
+            cb_content = "(error reading clipboard)"
 
-def on_release_shift(key):
-    global recording_shift, shift_guard
-    # only fire on Shift release
-    if key not in (keyboard.Key.shift_l, keyboard.Key.shift_r):
-        if key in (keyboard.Key.ctrl_l, keyboard.Key.ctrl_r):
-            pressed_shift.discard('ctrl')
-        return
-    pressed_shift.discard('shift')
-    if recording_shift and not shift_guard and not {'ctrl','shift'} <= pressed_shift:
-        shift_guard      = True
-        recording_shift  = False
-        threading.Thread(target=_stop_shift, daemon=True).start()
+        # Format the system prompt with clipboard content and user request
+        formatted_system_prompt = CTRL_SHIFT_PROMPT.format(
+            clipboard_content=cb_content,
+            user_request=request_transcript # Include user request here for context within the prompt
+        )
 
-# ===== MAIN =====
+        print("SHIFT_TASK: Calling Assistant LLM...")
+        # Pass the formatted system prompt. The user message is now the raw request transcript.
+        assistant_response = chat(MODEL_ASSISTANT, formatted_system_prompt, request_transcript,
+                                  temp=0.7, top_p=1, max_tokens=1000).strip()
+
+        if not assistant_response:
+             print("SHIFT_TASK: Assistant returned empty result, aborting paste.")
+             play_err()
+             return
+
+        print(f"SHIFT_TASK: Assistant response complete.")
+        clipboard.copy(assistant_response)
+        print("SHIFT_TASK: Copied assistant response to clipboard.")
+        safe_paste()
+    except Exception as e:
+        print(f"!!! SHIFT_TASK Error: {e}")
+        if isinstance(e, ValueError) and "Assistant model not configured" in str(e):
+            pass
+        else:
+            play_err()
+    finally:
+        print("--- Finished Shift Task ---")
+        badge.set("ready")
+
+# ───────────────────── HOT‑KEY FSM ─────────────────── #
+
+class HotKeys:
+    def __init__(self):
+        self.ctrl=self.alt=self.shift=False; self.mode=None
+        self.listener = keyboard.Listener(on_press=self.p,on_release=self.r)
+        self.listener.start()
+        print("HotKey listener started.")
+
+    def p(self,k):
+        key_pressed = None
+        if k in (keyboard.Key.ctrl_l, keyboard.Key.ctrl_r):   self.ctrl=True; key_pressed="Ctrl"
+        elif k in (keyboard.Key.alt_l, keyboard.Key.alt_r):    self.alt=True; key_pressed="Alt"
+        elif k in (keyboard.Key.shift_l, keyboard.Key.shift_r): self.shift=True; key_pressed="Shift"
+
+        if key_pressed:
+            self._start()
+
+    def r(self,k):
+        key_released = None
+        if k in (keyboard.Key.ctrl_l, keyboard.Key.ctrl_r):   self.ctrl=False; key_released="Ctrl"
+        elif k in (keyboard.Key.alt_l, keyboard.Key.alt_r):    self.alt=False; key_released="Alt"
+        elif k in (keyboard.Key.shift_l, keyboard.Key.shift_r): self.shift=False; key_released="Shift"
+
+        if key_released:
+            self._stop(k)
+
+    def _start(self):
+        # Check for Ctrl+Alt (Formatter)
+        if self.ctrl and self.alt and not self.shift and self.mode is None:
+            self.mode="alt"
+            print("HOTKEY: Ctrl+Alt detected, starting recording (Formatter).")
+            play_ding() # Specific sound for formatter
+            badge.set("recording"); rec.start()
+        # Check for Ctrl+Shift (Assistant)
+        elif self.ctrl and self.shift and not self.alt and self.mode is None:
+            self.mode="shift"
+            print("HOTKEY: Ctrl+Shift detected, starting recording (Assistant).")
+            play_hi() # Specific sound for assistant
+            badge.set("recording"); rec.start()
+
+    def _stop(self, released_key):
+        # Trigger alt_task if Ctrl or Alt is released while in 'alt' mode
+        if self.mode == "alt" and released_key in (keyboard.Key.ctrl_l, keyboard.Key.ctrl_r, keyboard.Key.alt_l, keyboard.Key.alt_r):
+             if not self.ctrl or not self.alt:
+                self._finish(alt_task) # Call formatter task
+        # Trigger shift_task if Ctrl or Shift is released while in 'shift' mode
+        elif self.mode == "shift" and released_key in (keyboard.Key.ctrl_l, keyboard.Key.ctrl_r, keyboard.Key.shift_l, keyboard.Key.shift_r):
+            if not self.ctrl or not self.shift:
+                self._finish(shift_task) # Call assistant task
+
+    def _finish(self, fn):
+        active_mode = self.mode
+        self.mode = None # Reset mode immediately
+        print(f"FINISH: Finishing task for mode '{active_mode}' -> {fn.__name__}")
+        play_end()
+        audio, dur = rec.stop()
+
+        if audio is None or dur < 0.5:
+            print(f"FINISH: Recording too short ({dur:.2f}s) or failed. Aborting task.")
+            play_short()
+            badge.set("ready")
+            return
+
+        print(f"FINISH: Submitting task '{fn.__name__}' to executor.")
+        EXECUTOR.submit(fn, audio)
+
+# ───────────────────── MAIN ──────────────────────── #
 
 def main():
-    keyboard.Listener(on_press=on_press_alt,    on_release=on_release_alt).start()
-    keyboard.Listener(on_press=on_press_shift,  on_release=on_release_shift).start()
-    print("Ready. Hold Ctrl+Alt or Ctrl+Shift and speak.")
-    while True:
-        time.sleep(1)
+    print("--- Starting Main Application ---")
+    if MODEL_ASSISTANT == "change_me":
+        print("\n" + "*"*60)
+        print("!!! WARNING: Assistant model (MODEL_ASSISTANT) is not configured. !!!")
+        print("!!!          Ctrl+Shift functionality will raise an error.       !!!")
+        print("!!!          Please update the 'change_me' value.                !!!")
+        print("*"*60 + "\n")
+
+    hotkey_manager = HotKeys()
+    print("\n" + "="*40)
+    print("Ready. Hold Ctrl+Alt (Format) or Ctrl+Shift (Assistant) and speak.")
+    print("Press Ctrl+C in the console to exit.")
+    print("="*40 + "\n")
+    try:
+        badge.tk.mainloop()
+    except KeyboardInterrupt:
+        print("\n--- KeyboardInterrupt detected, shutting down. ---")
+    finally:
+        print("--- Cleaning up ---")
+        EXECUTOR.shutdown(wait=False)
+        if hotkey_manager and hotkey_manager.listener:
+             hotkey_manager.listener.stop()
+        print("--- Exited ---")
 
 if __name__ == "__main__":
     main()
