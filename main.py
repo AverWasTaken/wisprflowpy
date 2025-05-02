@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import ctypes, json, queue, threading, time, traceback, wave, io
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Tuple
