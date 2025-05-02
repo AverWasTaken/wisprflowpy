@@ -1,6 +1,6 @@
 numpy
-sounddevice
 clipboard
-pyautogui
+sounddevice
+deepgram-sdk
 openai
 pynput
