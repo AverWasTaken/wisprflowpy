@@ -1,6 +1,7 @@
 numpy
-clipboard
 sounddevice
-deepgram-sdk
+clipboard
+pyautogui
 openai
 pynput
+pygame
